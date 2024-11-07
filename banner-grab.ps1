@@ -1,13 +1,14 @@
-# Define the target IP address and port
-$ipAddress = "target_ip_address"
-$port = target_port_number
+param(
+    [string]$ip,
+    [int]$port
+)
 
 # Create a TCP client
 $client = New-Object System.Net.Sockets.TcpClient
 
 try {
     # Connect to the target
-    $client.Connect($ipAddress, $port)
+    $client.Connect($ip, $port)
 
     # Get the network stream
     $stream = $client.GetStream()
@@ -20,14 +21,12 @@ try {
 
     # Convert the bytes to a string
     $banner = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $bytesRead)
-
-    # Output the banner
+    
     Write-Output "Banner: $banner"
 }
 catch {
     Write-Output "Error: $_"
 }
 finally {
-    # Close the connection
     $client.Close()
 }
