@@ -1,61 +1,69 @@
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$Target,
 
-    [int[]]$Ports = (1..1024),
-    [int]$Timeout = 200,
-    [int]$Concurrency = 100
+    [int[]]$Ports = (1..1024),  # default range
+    [int]$Timeout = 200,        # ms per port
+    [int]$Concurrency = 100     # max parallel jobs
 )
 
-# Create semaphore
-$sem = New-Object System.Threading.SemaphoreSlim($Concurrency, $Concurrency)
-$jobs = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]
+Write-Host ("Scanning {0} ..." -f $Target)
 
-Write-Host "Scanning $Target ..."
+$jobs = @()
 
 foreach ($port in $Ports) {
 
-    # capture loop vars explicitly (Windows PS hates closure of loop variables)
-    $currentPort  = $port
-    $currentTarget = $Target
-    $currentTimeout = $Timeout
-    $currentSem = $sem
+    # Throttle number of concurrent jobs
+    while ((Get-Job -State Running).Count -ge $Concurrency) {
+        Start-Sleep -Milliseconds 50
+    }
 
-    # throttle
-    $null = $currentSem.WaitAsync()
+    $jobs += Start-Job -ScriptBlock {
+        param($Target, $Port, $Timeout)
 
-    $task = [System.Threading.Tasks.Task]::Run({
+        $client = New-Object System.Net.Sockets.TcpClient
         try {
-            $client = New-Object System.Net.Sockets.TcpClient
-            $async = $client.BeginConnect($currentTarget, $currentPort, $null, $null)
-            $success = $async.AsyncWaitHandle.WaitOne($currentTimeout)
+            # Start async connect
+            $iar = $client.BeginConnect($Target, $Port, $null, $null)
+            $success = $iar.AsyncWaitHandle.WaitOne($Timeout)
 
             if ($success -and $client.Connected) {
-                $client.EndConnect($async)
-                return [PSCustomObject]@{
-                    Port  = $currentPort
-                    State = "Open"
+                $client.EndConnect($iar)
+                [PSCustomObject]@{
+                    Port  = $Port
+                    State = 'Open'
                 }
             }
-        } catch { }
-        finally {
-            try { $client.Close() } catch { }
-            $currentSem.Release() | Out-Null
+        } catch {
+            # ignore errors (host unreachable, etc.)
+        } finally {
+            try { $client.Close() } catch {}
         }
-    })
 
-    $jobs.Add($task)
+    } -ArgumentList $Target, $port, $Timeout
 }
 
-# Wait for everything to finish
-[System.Threading.Tasks.Task]::WaitAll($jobs.ToArray())
+if ($jobs.Count -gt 0) {
+    # Wait for all jobs to finish
+    $jobs | Wait-Job | Out-Null
 
-# Collect results
-$openPorts = $jobs |
-    Where-Object { $_.Result -ne $null } |
-    ForEach-Object { $_.Result } |
-    Sort-Object Port
+    # Collect results
+    $results = $jobs | Receive-Job
+    Remove-Job $jobs
 
-Write-Host ""
-Write-Host ("Open ports on {0}:" -f $Target)
-$openPorts | Format-Table -AutoSize
+    $openPorts = $results |
+        Where-Object { $_ -ne $null } |
+        Sort-Object Port
+
+    Write-Host ""
+    Write-Host ("Open ports on {0}:" -f $Target)
+
+    if ($openPorts) {
+        $openPorts | Format-Table -AutoSize
+    } else
+        {
+        Write-Host "No open ports found in the given range."
+    }
+} else {
+    Write-Host "No ports to scan."
+}
