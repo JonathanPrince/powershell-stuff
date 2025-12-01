@@ -2,46 +2,60 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Target,
 
-    [int[]]$Ports = (1..1024),          # default Nmap port range
-    [int]$Timeout = 200,                # ms per port (lightweight)
-    [int]$Concurrency = 100             # limit parallel load
+    [int[]]$Ports = (1..1024),
+    [int]$Timeout = 200,
+    [int]$Concurrency = 100
 )
 
-# Semaphore to throttle concurrency
-$sem = [System.Threading.SemaphoreSlim]::new($Concurrency, $Concurrency)
-$jobs = @()
+# Create semaphore
+$sem = New-Object System.Threading.SemaphoreSlim($Concurrency, $Concurrency)
+$jobs = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task]
 
 Write-Host "Scanning $Target ..."
 
 foreach ($port in $Ports) {
-    $null = $sem.WaitAsync()
-    
-    $jobs += [System.Threading.Tasks.Task]::Run({
+
+    # capture loop vars explicitly (Windows PS hates closure of loop variables)
+    $currentPort  = $port
+    $currentTarget = $Target
+    $currentTimeout = $Timeout
+    $currentSem = $sem
+
+    # throttle
+    $null = $currentSem.WaitAsync()
+
+    $task = [System.Threading.Tasks.Task]::Run({
         try {
             $client = New-Object System.Net.Sockets.TcpClient
-            $async = $client.BeginConnect($using:Target, $using:port, $null, $null)
-            $success = $async.AsyncWaitHandle.WaitOne($using:Timeout)
+            $async = $client.BeginConnect($currentTarget, $currentPort, $null, $null)
+            $success = $async.AsyncWaitHandle.WaitOne($currentTimeout)
 
             if ($success -and $client.Connected) {
                 $client.EndConnect($async)
-                [PSCustomObject]@{
-                    Port  = $using:port
+                return [PSCustomObject]@{
+                    Port  = $currentPort
                     State = "Open"
                 }
             }
-        } catch {
-            # ignored
-        } finally {
-            $client.Close()
-            $using:sem.Release() | Out-Null
+        } catch { }
+        finally {
+            try { $client.Close() } catch { }
+            $currentSem.Release() | Out-Null
         }
     })
+
+    $jobs.Add($task)
 }
 
+# Wait for everything to finish
+[System.Threading.Tasks.Task]::WaitAll($jobs.ToArray())
+
 # Collect results
-$results = [System.Threading.Tasks.Task]::WaitAll($jobs, 300000)  # 5 min max
-$openPorts = $jobs | Where-Object { $_.Result -ne $null } | ForEach-Object { $_.Result }
+$openPorts = $jobs |
+    Where-Object { $_.Result -ne $null } |
+    ForEach-Object { $_.Result } |
+    Sort-Object Port
 
 Write-Host ""
-Write-Host "Open ports on $Target:"
-$openPorts | Sort-Object Port | Format-Table -AutoSize
+Write-Host ("Open ports on {0}:" -f $Target)
+$openPorts | Format-Table -AutoSize
